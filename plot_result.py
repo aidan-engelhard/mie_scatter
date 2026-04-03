@@ -12,11 +12,9 @@ class MLP(nn.Module):
     def __init__(self):
         super().__init__()
         self.layers = nn.Sequential(
-            nn.Linear(4, 256),
+            nn.Linear(4, 128),
             nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
+            nn.Linear(128, 128),
             nn.ReLU(),
             nn.Linear(128, 6)   # predict 6 channels
         )
@@ -57,7 +55,7 @@ num_points = H * W
 # ---------------------------------------------------------
 # 3. Select wavelength and prepare inputs
 # ---------------------------------------------------------
-chosen_lam = 7.0
+chosen_lam = 6.0
 chosen_m = 2 * chosen_lam
 chosen_k = 5 * chosen_lam
 
@@ -141,7 +139,7 @@ titles = [
     "|E| Norm"
 ]
 
-plt.figure(figsize=(28, 10))  # Wider, shorter canvas for 3×7 layout
+plt.figure(figsize=(28, 10)) 
 
 for i in range(7):
     # ROW 1: Model prediction

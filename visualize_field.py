@@ -6,7 +6,7 @@ import miepython.field as fields
 # 1. Define 3D grid
 # -----------------------
 N = 41  # lower resolution for interactive 3D plotting
-u = np.linspace(-2, 2, N)
+u = np.linspace(-1.5, 1.5, N)
 
 X, Y, Z = np.meshgrid(u, u, u, indexing="ij")
 
@@ -29,8 +29,27 @@ Ex = E_xyz[0]
 Ey = E_xyz[1]
 Ez = E_xyz[2]
 
+Hx = H_xyz[0]
+Hy = H_xyz[1]
+Hz = H_xyz[2]
+
 # Magnitude
 E_norm = np.sqrt(np.abs(Ex)**2 + np.abs(Ey)**2 + np.abs(Ez)**2)
+
+
+# Compute Poynting vector:
+# S = 1/2 Re( E × H* )
+
+Hx_c = np.conj(Hx)
+Hy_c = np.conj(Hy)
+Hz_c = np.conj(Hz)
+
+Sx = 0.5 * np.real(Ey * Hz_c - Ez * Hy_c)
+Sy = 0.5 * np.real(Ez * Hx_c - Ex * Hz_c)
+Sz = 0.5 * np.real(Ex * Hy_c - Ey * Hx_c)
+
+S_mag = np.sqrt(Sx**2 + Sy**2 + Sz**2)
+
 
 # -----------------------
 # 3. Build PyVista grid
@@ -52,8 +71,15 @@ grid["vectors_imag"] = np.column_stack([
     Ez.imag.ravel(order="F")
 ])
 
-# Optional scalar for coloring
-grid["E_norm"] = E_norm.ravel(order="F")
+
+grid["S_vector"] = np.column_stack([
+    Sx.ravel(order="F"),
+    Sy.ravel(order="F"),
+    Sz.ravel(order="F")
+])
+
+grid["S_mag"] = S_mag.ravel(order="F")
+
 
 # --- Visualize vector field ---
 plotter = pv.Plotter()
@@ -61,7 +87,7 @@ plotter = pv.Plotter()
 # Add arrows (vector field)
 plotter.add_arrows(
     grid.points,
-    grid["vectors_imag"],
+    grid["S_vector"],
     mag=0.2,            # scale arrow size
     opacity=0.8,
 )

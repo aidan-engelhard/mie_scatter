@@ -1,0 +1,302 @@
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+import os
+
+# ---------------------------------------------------------
+# 1. Load NPZ data
+# ---------------------------------------------------------
+script_dir = os.path.dirname(os.path.abspath(__file__))
+data_path = os.path.join(script_dir, "electric_fields.npz")
+data = np.load(data_path)
+ 
+# Load REAL and IMAG components
+Ex_r = data["Ex_real"]   # (m, H, W)
+Ex_i = data["Ex_imag"]
+Ey_r = data["Ey_real"]
+Ey_i = data["Ey_imag"]
+Ez_r = data["Ez_real"]
+Ez_i = data["Ez_imag"]
+
+X = data["X"]
+Y = data["Y"]
+Z = data["Z"]
+
+lam_values = data["lam_values"]
+m_values = data["m_values"]
+k_values = data["k_values"]
+
+num_lam = Ex_r.shape[0]
+H, W = X.shape
+num_points = H * W
+
+print("Loaded data:")
+print(" Ex_r:", Ex_r.shape)
+print(" Grid:", X.shape, Y.shape, Z.shape)
+print(" λ values:", lam_values.shape)
+print(" num_points =", num_points)
+
+# ---------------------------------------------------------
+# 2. Flatten grid + build dataset
+# ---------------------------------------------------------
+X_flat = X.reshape(-1).astype(np.float32)
+Y_flat = Y.reshape(-1).astype(np.float32)
+Z_flat = Z.reshape(-1).astype(np.float32)
+
+coords_list = []
+params_list = []
+targets_list = []
+helm_list = []  # store (n^2 k0^2) values for PDE
+
+for i in range(num_lam):
+    lam_val = lam_values[i]
+    m = m_values[i]
+    k = k_values[i]
+
+    # Complex refractive index
+    n_complex = m + 1j * k
+    k0 = 2 * np.pi / lam_val
+    helm_coeff = (n_complex**2 * k0**2)  # complex
+    helm_real = np.real(helm_coeff).astype(np.float32)
+    helm_imag = np.imag(helm_coeff).astype(np.float32)
+
+    lam_col = np.full((num_points,), lam_val, dtype=np.float32)
+    helm_real_col = np.full((num_points,), helm_real, dtype=np.float32)
+    helm_imag_col = np.full((num_points,), helm_imag, dtype=np.float32)
+
+    helm_coeff_pair = np.column_stack([helm_real_col, helm_imag_col])
+
+    # Inputs: (x, y, z), (λ)
+    coords = np.column_stack([X_flat, Y_flat, Z_flat])
+    params = lam_col.reshape(-1,1)
+
+    # Targets: 6 channels (Ex_r, Ex_i, Ey_r, Ey_i, Ez_r, Ez_i)
+    tar = np.column_stack([
+        Ex_r[i].reshape(-1), Ex_i[i].reshape(-1),
+        Ey_r[i].reshape(-1), Ey_i[i].reshape(-1),
+        Ez_r[i].reshape(-1), Ez_i[i].reshape(-1),
+    ]).astype(np.float32)
+    
+    coords_list.append(coords)
+    params_list.append(params)
+    targets_list.append(tar)
+    helm_list.append(helm_coeff_pair)
+
+# Stack all data
+coords_all = torch.tensor(np.vstack(coords_list), dtype=torch.float32)
+params_all = torch.tensor(np.vstack(params_list), dtype=torch.float32)
+Y_all = torch.tensor(np.vstack(targets_list), dtype=torch.float32)
+helm_all = torch.tensor(np.concatenate(helm_list), dtype=torch.float32)
+
+
+# ---------------------------------------------------------
+# 3. Train/test split based on wavelength index
+# ---------------------------------------------------------
+num_train_lam = 80  # first 80 λ values for training
+
+sample_lam_indices = np.repeat(np.arange(num_lam), num_points)
+train_mask = torch.tensor(sample_lam_indices < num_train_lam, dtype=torch.bool)
+test_mask = ~train_mask
+
+coords_train, params_train, Y_train, helm_train = coords_all[train_mask], params_all[train_mask], Y_all[train_mask], helm_all[train_mask]
+coords_test, params_test, Y_test, helm_test = coords_all[test_mask], params_all[test_mask], Y_all[test_mask], helm_all[test_mask]
+
+train_ds = TensorDataset(coords_train, params_train, Y_train, helm_train)
+test_ds  = TensorDataset(coords_test, params_test, Y_test, helm_test)
+
+train_loader = DataLoader(train_ds, batch_size=4096, shuffle=True)
+test_loader  = DataLoader(test_ds, batch_size=4096, shuffle=False)
+
+# ---------------------------------------------------------
+# 4. Neural network model
+# ---------------------------------------------------------
+# ---------------------------------------------------------
+# DeepONet networks
+# ---------------------------------------------------------
+
+class BranchNet(nn.Module):
+    def __init__(self, param_dim=1, width=128, latent_dim=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(param_dim, width),
+            nn.ReLU(),
+            nn.Linear(width, width),
+            nn.ReLU(),
+            nn.Linear(width, latent_dim)
+        )
+
+    def forward(self, lam):
+        return self.net(lam)
+
+
+class TrunkNet(nn.Module):
+    def __init__(self, coord_dim=3, width=128, latent_dim=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(coord_dim, width),
+            nn.ReLU(),
+            nn.Linear(width, width),
+            nn.ReLU(),
+            nn.Linear(width, latent_dim)
+        )
+
+    def forward(self, xyz):
+        return self.net(xyz)
+
+
+class DeepONet(nn.Module):
+    def __init__(self, latent_dim=128, output_dim=6):
+        super().__init__()
+        self.branch = BranchNet(param_dim=1, latent_dim=latent_dim)
+        self.trunk  = TrunkNet(coord_dim=3, latent_dim=latent_dim)
+
+        # Final linear layer maps inner-product → field components
+        self.out = nn.Linear(latent_dim, output_dim)
+
+    def forward(self, coords, params):
+        """
+        coords: (N,3)   = (x,y,z)
+        params: (N,1)   = λ
+        """
+        b = self.branch(params)   # (N, latent)
+        t = self.trunk(coords)    # (N, latent)
+
+        # Elementwise product = DeepONet operator learning
+        prod = b * t              # (N, latent)
+
+        return self.out(prod)     # -> (N,6)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+model = DeepONet().to(device)
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+# Function for Laplacian
+def laplacian(outputs, inputs):
+    """
+    Compute ΔE using autograd.
+    outputs: (batch, 6)
+    inputs:  (batch, 3) -> (x, y, z)
+    """
+    grads = torch.autograd.grad(
+        outputs, inputs,
+        grad_outputs=torch.ones_like(outputs),
+        create_graph=True,
+        retain_graph=True
+    )[0]  # shape: (batch, 3)
+
+    # Second derivatives
+    lap = 0.0
+    for i in range(3):  # only x,y,z
+        grad_i = grads[:, i]
+        second = torch.autograd.grad(
+            grad_i, inputs,
+            grad_outputs=torch.ones_like(grad_i),
+            create_graph=True,
+            retain_graph=True
+        )[0][:, i]
+        lap += second
+
+    return lap
+
+# ---------------------------------------------------------
+# 5. Training loop
+# ---------------------------------------------------------
+lambda_pde = 1.0   # weight of PDE loss
+epochs = 40
+for epoch in range(epochs):
+    model.train()
+    epoch_loss = 0.0
+
+    for coordb, paramb, yb, helm in train_loader:
+        coordb, paramb, yb, helm = coordb.to(device).requires_grad_(True), paramb.to(device), yb.to(device), helm.to(device)
+        optimizer.zero_grad()
+
+        pred = model(coordb, paramb)
+        data_loss = criterion(pred, yb)
+
+        # PDE loss: full complex Helmholtz PDE
+        pde_loss = 0.0
+
+        # --- Compute radius to determine inside/outside sphere ---
+        r = torch.sqrt(coordb[:,0]**2 + coordb[:,1]**2 + coordb[:,2]**2)
+        inside = (r <= 0.5)
+        outside = ~inside
+
+        # --- Compute free-space k0^2 ---
+        lam = paramb[:, 0]
+        k0 = 2 * torch.pi / lam
+        k0_sq = k0**2
+
+        # --- Helmholtz coefficients from dataset ---
+        a = helm[:, 0]   # real part
+        b = helm[:, 1]   # imag part
+
+        # --- Effective coefficients ---
+        a_eff = torch.zeros_like(a)
+        b_eff = torch.zeros_like(b)
+
+        # Inside sphere: actual material coefficient
+        a_eff[inside] = a[inside]
+        b_eff[inside] = b[inside]
+
+        # Outside sphere: free space (n = 1 + i0)
+        a_eff[outside] = k0_sq[outside]
+        b_eff[outside] = 0.0
+
+
+        # Loop over field components in pairs:
+        # (0,1) = Ex_real, Ex_imag
+        # (2,3) = Ey_real, Ey_imag
+        # (4,5) = Ez_real, Ez_imag
+        for idx_r in [0, 2, 4]:
+            idx_i = idx_r + 1
+
+            # Extract predicted real/imag fields
+            E_r = pred[:, idx_r]
+            E_i = pred[:, idx_i]
+
+            # Compute Laplacian(E_real) and Laplacian(E_imag)
+            lap_r = laplacian(E_r, coordb)
+            lap_i = laplacian(E_i, coordb)
+
+            # Complex Helmholtz PDE split into real and imaginary equations:
+            #   lap_r = a*E_r - b*E_i
+            #   lap_i = a*E_i + b*E_r
+
+            pde_r = lap_r - (a_eff * E_r - b_eff * E_i)
+            pde_i = lap_i - (a_eff * E_i + b_eff * E_r)
+
+            # Accumulate PDE residual
+            pde_loss += torch.mean(pde_r**2) + torch.mean(pde_i**2)
+
+        loss = data_loss + lambda_pde * pde_loss
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.item()
+
+    if epoch % 4 == 0:
+        print(f"Epoch {epoch}/{epochs} - Loss = {epoch_loss/len(train_loader):.6f}, Data: {data_loss.item():.6f}, PDE: {pde_loss.item():.6f}")
+
+# ---------------------------------------------------------
+# 6. Test evaluation
+# ---------------------------------------------------------
+model.eval()
+test_losses = []
+
+with torch.no_grad():
+    for coordb, paramb, yb, hem in test_loader:
+        coordb, paramb, yb, hem = coordb.to(device), paramb.to(device), yb.to(device), hem.to(device)
+        pred = model(coordb, paramb)
+        test_losses.append(criterion(pred, yb).item())
+
+print("\n✅ Test MSE:", np.mean(test_losses))
+
+# ---------------------------------------------------------
+# 7. Save model
+# ---------------------------------------------------------
+torch.save(model.state_dict(), "Efield_predictor_deeponet.pt")
+print("✅ Saved model as Efield_predictor_deeponet.pt")

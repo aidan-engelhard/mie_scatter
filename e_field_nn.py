@@ -105,7 +105,7 @@ class MLP(nn.Module):
             nn.ReLU(),
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(128, 6)  # OUTPUT 6 field components
+            nn.Linear(128, 6) 
         )
 
     def forward(self, x):
@@ -121,7 +121,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 # ---------------------------------------------------------
 # 5. Training loop
 # ---------------------------------------------------------
-epochs = 100
+epochs = 200
 for epoch in range(epochs):
     model.train()
     epoch_loss = 0.0
