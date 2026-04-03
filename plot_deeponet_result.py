@@ -67,8 +67,8 @@ class DeepONet(nn.Module):
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
-model_path = os.path.join(script_dir, "Efield_predictor_deeponet.pt")
-data_path = os.path.join(script_dir, "electric_fields.npz")
+model_path = os.path.join(script_dir, "models/Efield_predictor_deeponet.pt")
+data_path = os.path.join(script_dir, "inputs/electric_fields.npz")
 
 print("Loading DeepONet model:", model_path)
 model = DeepONet().to(device)
