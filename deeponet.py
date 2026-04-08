@@ -3,12 +3,14 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import os
+import csv
 
 # ---------------------------------------------------------
-# 1. Load NPZ data
+# Load NPZ data
 # ---------------------------------------------------------
+R = 0.5 # radius of the sphere (from dataset description)
 script_dir = os.path.dirname(os.path.abspath(__file__))
-data_path = os.path.join(script_dir, "electric_fields.npz")
+data_path = os.path.join(script_dir, "inputs/electric_fields.npz")
 data = np.load(data_path)
  
 # Load REAL and IMAG components
@@ -38,7 +40,7 @@ print(" λ values:", lam_values.shape)
 print(" num_points =", num_points)
 
 # ---------------------------------------------------------
-# 2. Flatten grid + build dataset
+# Flatten grid + build dataset
 # ---------------------------------------------------------
 X_flat = X.reshape(-1).astype(np.float32)
 Y_flat = Y.reshape(-1).astype(np.float32)
@@ -91,7 +93,7 @@ helm_all = torch.tensor(np.concatenate(helm_list), dtype=torch.float32)
 
 
 # ---------------------------------------------------------
-# 3. Train/test split based on wavelength index
+# Train/test split based on wavelength index
 # ---------------------------------------------------------
 num_train_lam = 80  # first 80 λ values for training
 
@@ -109,10 +111,7 @@ train_loader = DataLoader(train_ds, batch_size=4096, shuffle=True)
 test_loader  = DataLoader(test_ds, batch_size=4096, shuffle=False)
 
 # ---------------------------------------------------------
-# 4. Neural network model
-# ---------------------------------------------------------
-# ---------------------------------------------------------
-# DeepONet networks
+# DeepONet architecture:
 # ---------------------------------------------------------
 
 class BranchNet(nn.Module):
@@ -174,7 +173,7 @@ model = DeepONet().to(device)
 criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-# Function for Laplacian
+# Helper function for Laplacian
 def laplacian(outputs, inputs):
     """
     Compute ΔE using autograd.
@@ -202,11 +201,108 @@ def laplacian(outputs, inputs):
 
     return lap
 
+# Helper function to sample points on sphere boundary
+def sample_sphere_boundary(N, R, device):
+    theta = torch.rand(N, device=device) * 2 * np.pi
+    phi = torch.acos(2*torch.rand(N, device=device) - 1)
+
+    x = R * torch.sin(phi) * torch.cos(theta)
+    y = R * torch.sin(phi) * torch.sin(theta)
+    z = R * torch.cos(phi)
+
+    return torch.stack([x, y, z], dim=1)
+
+
+# Helper function to get boundary pairs (inside/outside) and normals
+def get_boundary_pairs(coords_b, R, eps=1e-3):
+    """
+    coords_b: (Nb, 3) points ON the boundary
+    R: scatterer radius
+    eps: small offset
+
+    Returns:
+        coords_in, coords_out, normals
+    """
+
+    # radial distance
+    r = torch.norm(coords_b, dim=1, keepdim=True)
+
+    # outward normal
+    n_hat = coords_b / r
+
+    # shift slightly inside / outside
+    coords_in = coords_b - eps * n_hat
+    coords_out = coords_b + eps * n_hat
+
+    return coords_in, coords_out, n_hat
+
+# Helper function to compute normal derivative dE/dn
+def normal_derivative(E, coords, normals):
+    """
+    E: (N, 6) field outputs
+    coords: (N, 3)
+    normals: (N, 3)
+    """
+
+    grads = torch.autograd.grad(
+        E, coords,
+        grad_outputs=torch.ones_like(E),
+        create_graph=True,
+        retain_graph=True
+    )[0]                         # (N, 3)
+
+    # scalar normal derivative for each field component
+    dEdn = torch.sum(grads * normals, dim=1, keepdim=True)
+    return dEdn
+
+# Helper function to compute boundary loss
+def boundary_loss(model, coords_b, params_b, R):
+    """
+    Enforces:
+      E_in = E_out
+      dE/dn_in = dE/dn_out
+    """
+
+    coords_b.requires_grad_(True)
+
+    # create inside / outside points
+    coords_in, coords_out, normals = get_boundary_pairs(coords_b, R)
+
+    coords_in.requires_grad_(True)
+    coords_out.requires_grad_(True)
+
+    # predict fields
+    E_in = model(coords_in, params_b)
+    E_out = model(coords_out, params_b)
+
+    # field continuity
+    loss_E = torch.mean((E_in - E_out)**2)
+
+    # normal derivative continuity
+    dEin_dn = normal_derivative(E_in, coords_in, normals)
+    dEout_dn = normal_derivative(E_out, coords_out, normals)
+
+    loss_dE = torch.mean((dEin_dn - dEout_dn)**2)
+
+    return loss_E, loss_dE
+
 # ---------------------------------------------------------
-# 5. Training loop
+# Training loop
 # ---------------------------------------------------------
-lambda_pde = 1.0   # weight of PDE loss
-epochs = 40
+# weights for loss terms
+lambda_data = 0.0
+lambda_pde = 1.0  
+lambda_E_bc = 1.0
+lambda_dE_bc = 1.0
+
+epochs = 100
+Nb = 1000 # number of boundary points per epoch
+loss_history = []
+data_loss_history = []
+pde_loss_history = []
+loss_E_bc_history = []
+loss_dE_bc_history = []
+
 for epoch in range(epochs):
     model.train()
     epoch_loss = 0.0
@@ -223,7 +319,7 @@ for epoch in range(epochs):
 
         # --- Compute radius to determine inside/outside sphere ---
         r = torch.sqrt(coordb[:,0]**2 + coordb[:,1]**2 + coordb[:,2]**2)
-        inside = (r <= 0.5)
+        inside = (r <= R)
         outside = ~inside
 
         # --- Compute free-space k0^2 ---
@@ -273,13 +369,50 @@ for epoch in range(epochs):
             # Accumulate PDE residual
             pde_loss += torch.mean(pde_r**2) + torch.mean(pde_i**2)
 
-        loss = data_loss + lambda_pde * pde_loss
+        
+        # --- Boundary loss ---
+        coords_boundary = sample_sphere_boundary(Nb, R, device)
+        
+        Nb = coords_boundary.shape[0]
+
+        # pick one physical configuration (e.g. first in batch)
+        param_single = paramb[0:1]                 # (1, param_dim)
+
+        # repeat for all boundary points
+        params_boundary = param_single.repeat(Nb, 1)  # (Nb, param_dim)
+
+
+        loss_E_bc, loss_dE_bc = boundary_loss(
+            model, coords_boundary, params_boundary, R
+        )
+
+
+        loss = lambda_data*data_loss + lambda_pde * pde_loss + lambda_E_bc * loss_E_bc + lambda_dE_bc * loss_dE_bc
         loss.backward()
         optimizer.step()
         epoch_loss += loss.item()
 
-    if epoch % 4 == 0:
-        print(f"Epoch {epoch}/{epochs} - Loss = {epoch_loss/len(train_loader):.6f}, Data: {data_loss.item():.6f}, PDE: {pde_loss.item():.6f}")
+        loss_history.append(loss.item())
+        data_loss_history.append(data_loss.item())      
+        pde_loss_history.append(pde_loss.item())
+        loss_E_bc_history.append(loss_E_bc.item())
+        loss_dE_bc_history.append(loss_dE_bc.item())
+
+    if epoch % 10 == 0:
+        print(f"Epoch {epoch}/{epochs} - Loss = {epoch_loss/len(train_loader):.6f}", 
+                f"Data: {data_loss.item():.6f}", 
+                f"PDE: {pde_loss.item():.6f}",
+                f"BC_E: {loss_E_bc.item():.6f}", 
+                f"BC_dE: {loss_dE_bc.item():.6f}")
+
+# Save training losses to CSV
+with open("training_losses.csv", mode="w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["epoch", "loss", "data_loss", "pde_loss", "loss_E_bc", "loss_dE_bc"])  # header
+
+    for epoch, (loss, data_loss, pde_loss, loss_E_bc, loss_dE_bc) in enumerate(zip(loss_history, data_loss_history, pde_loss_history, loss_E_bc_history, loss_dE_bc_history)):
+        writer.writerow([epoch, loss, data_loss, pde_loss, loss_E_bc, loss_dE_bc])
+
 
 # ---------------------------------------------------------
 # 6. Test evaluation
@@ -298,5 +431,5 @@ print("\n✅ Test MSE:", np.mean(test_losses))
 # ---------------------------------------------------------
 # 7. Save model
 # ---------------------------------------------------------
-torch.save(model.state_dict(), "Efield_predictor_deeponet.pt")
-print("✅ Saved model as Efield_predictor_deeponet.pt")
+torch.save(model.state_dict(), "models/Efield_predictor_deeponet_physics_only.pt")
+print("✅ Saved model as Efield_predictor_deeponet_physics_only.pt")
