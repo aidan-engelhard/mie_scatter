@@ -290,12 +290,12 @@ def boundary_loss(model, coords_b, params_b, R):
 # Training loop
 # ---------------------------------------------------------
 # weights for loss terms
-lambda_data = 0.0
-lambda_pde = 1.0  
-lambda_E_bc = 1.0
-lambda_dE_bc = 1.0
+lambda_data = 1.0
+lambda_pde = 0.0  
+lambda_E_bc = 0.0
+lambda_dE_bc = 0.0
 
-epochs = 100
+epochs = 200
 Nb = 1000 # number of boundary points per epoch
 loss_history = []
 data_loss_history = []
@@ -303,116 +303,132 @@ pde_loss_history = []
 loss_E_bc_history = []
 loss_dE_bc_history = []
 
-for epoch in range(epochs):
-    model.train()
-    epoch_loss = 0.0
 
-    for coordb, paramb, yb, helm in train_loader:
-        coordb, paramb, yb, helm = coordb.to(device).requires_grad_(True), paramb.to(device), yb.to(device), helm.to(device)
-        optimizer.zero_grad()
-
-        pred = model(coordb, paramb)
-        data_loss = criterion(pred, yb)
-
-        # PDE loss: full complex Helmholtz PDE
-        pde_loss = 0.0
-
-        # --- Compute radius to determine inside/outside sphere ---
-        r = torch.sqrt(coordb[:,0]**2 + coordb[:,1]**2 + coordb[:,2]**2)
-        inside = (r <= R)
-        outside = ~inside
-
-        # --- Compute free-space k0^2 ---
-        lam = paramb[:, 0]
-        k0 = 2 * torch.pi / lam
-        k0_sq = k0**2
-
-        # --- Helmholtz coefficients from dataset ---
-        a = helm[:, 0]   # real part
-        b = helm[:, 1]   # imag part
-
-        # --- Effective coefficients ---
-        a_eff = torch.zeros_like(a)
-        b_eff = torch.zeros_like(b)
-
-        # Inside sphere: actual material coefficient
-        a_eff[inside] = a[inside]
-        b_eff[inside] = b[inside]
-
-        # Outside sphere: free space (n = 1 + i0)
-        a_eff[outside] = k0_sq[outside]
-        b_eff[outside] = 0.0
-
-
-        # Loop over field components in pairs:
-        # (0,1) = Ex_real, Ex_imag
-        # (2,3) = Ey_real, Ey_imag
-        # (4,5) = Ez_real, Ez_imag
-        for idx_r in [0, 2, 4]:
-            idx_i = idx_r + 1
-
-            # Extract predicted real/imag fields
-            E_r = pred[:, idx_r]
-            E_i = pred[:, idx_i]
-
-            # Compute Laplacian(E_real) and Laplacian(E_imag)
-            lap_r = laplacian(E_r, coordb)
-            lap_i = laplacian(E_i, coordb)
-
-            # Complex Helmholtz PDE split into real and imaginary equations:
-            #   lap_r = a*E_r - b*E_i
-            #   lap_i = a*E_i + b*E_r
-
-            pde_r = lap_r - (a_eff * E_r - b_eff * E_i)
-            pde_i = lap_i - (a_eff * E_i + b_eff * E_r)
-
-            # Accumulate PDE residual
-            pde_loss += torch.mean(pde_r**2) + torch.mean(pde_i**2)
-
-        
-        # --- Boundary loss ---
-        coords_boundary = sample_sphere_boundary(Nb, R, device)
-        
-        Nb = coords_boundary.shape[0]
-
-        # pick one physical configuration (e.g. first in batch)
-        param_single = paramb[0:1]                 # (1, param_dim)
-
-        # repeat for all boundary points
-        params_boundary = param_single.repeat(Nb, 1)  # (Nb, param_dim)
-
-
-        loss_E_bc, loss_dE_bc = boundary_loss(
-            model, coords_boundary, params_boundary, R
-        )
-
-
-        loss = lambda_data*data_loss + lambda_pde * pde_loss + lambda_E_bc * loss_E_bc + lambda_dE_bc * loss_dE_bc
-        loss.backward()
-        optimizer.step()
-        epoch_loss += loss.item()
-
-        loss_history.append(loss.item())
-        data_loss_history.append(data_loss.item())      
-        pde_loss_history.append(pde_loss.item())
-        loss_E_bc_history.append(loss_E_bc.item())
-        loss_dE_bc_history.append(loss_dE_bc.item())
-
-    if epoch % 10 == 0:
-        print(f"Epoch {epoch}/{epochs} - Loss = {epoch_loss/len(train_loader):.6f}", 
-                f"Data: {data_loss.item():.6f}", 
-                f"PDE: {pde_loss.item():.6f}",
-                f"BC_E: {loss_E_bc.item():.6f}", 
-                f"BC_dE: {loss_dE_bc.item():.6f}")
-
-# Save training losses to CSV
-with open("training_losses.csv", mode="w", newline="") as f:
+# --- open CSV once ---
+with open("training_losses.csv", "w", newline="") as f:
     writer = csv.writer(f)
-    writer.writerow(["epoch", "loss", "data_loss", "pde_loss", "loss_E_bc", "loss_dE_bc"])  # header
+    writer.writerow(["epoch", "loss", "data_loss", "pde_loss", "loss_E_bc", "loss_dE_bc"])
 
-    for epoch, (loss, data_loss, pde_loss, loss_E_bc, loss_dE_bc) in enumerate(zip(loss_history, data_loss_history, pde_loss_history, loss_E_bc_history, loss_dE_bc_history)):
-        writer.writerow([epoch, loss, data_loss, pde_loss, loss_E_bc, loss_dE_bc])
+    for epoch in range(epochs):
+        model.train()        
+        # running sums
+        epoch_loss = 0.0
+        epoch_data = 0.0
+        epoch_pde  = 0.0
+        epoch_Ebc  = 0.0
+        epoch_dEbc = 0.0
 
+        for coordb, paramb, yb, helm in train_loader:
+            coordb, paramb, yb, helm = coordb.to(device).requires_grad_(True), paramb.to(device), yb.to(device), helm.to(device)
+            optimizer.zero_grad()
+
+            pred = model(coordb, paramb)
+            data_loss = criterion(pred, yb)
+
+            # PDE loss: full complex Helmholtz PDE
+            pde_loss = 0.0
+
+            # --- Compute radius to determine inside/outside sphere ---
+            r = torch.sqrt(coordb[:,0]**2 + coordb[:,1]**2 + coordb[:,2]**2)
+            inside = (r <= R)
+            outside = ~inside
+
+            # --- Compute free-space k0^2 ---
+            lam = paramb[:, 0]
+            k0 = 2 * torch.pi / lam
+            k0_sq = k0**2
+
+            # --- Helmholtz coefficients from dataset ---
+            a = helm[:, 0]   # real part
+            b = helm[:, 1]   # imag part
+
+            # --- Effective coefficients ---
+            a_eff = torch.zeros_like(a)
+            b_eff = torch.zeros_like(b)
+
+            # Inside sphere: actual material coefficient
+            a_eff[inside] = a[inside]
+            b_eff[inside] = b[inside]
+
+            # Outside sphere: free space (n = 1 + i0)
+            a_eff[outside] = k0_sq[outside]
+            b_eff[outside] = 0.0
+
+
+            # Loop over field components in pairs:
+            # (0,1) = Ex_real, Ex_imag
+            # (2,3) = Ey_real, Ey_imag
+            # (4,5) = Ez_real, Ez_imag
+            for idx_r in [0, 2, 4]:
+                idx_i = idx_r + 1
+
+                # Extract predicted real/imag fields
+                E_r = pred[:, idx_r]
+                E_i = pred[:, idx_i]
+
+                # Compute Laplacian(E_real) and Laplacian(E_imag)
+                lap_r = laplacian(E_r, coordb)
+                lap_i = laplacian(E_i, coordb)
+
+                # Complex Helmholtz PDE split into real and imaginary equations:
+                #   lap_r = a*E_r - b*E_i
+                #   lap_i = a*E_i + b*E_r
+
+                pde_r = lap_r - (a_eff * E_r - b_eff * E_i)
+                pde_i = lap_i - (a_eff * E_i + b_eff * E_r)
+
+                # Accumulate PDE residual
+                pde_loss += torch.mean(pde_r**2) + torch.mean(pde_i**2)
+
+            
+            # --- Boundary loss ---
+            coords_boundary = sample_sphere_boundary(Nb, R, device)
+                
+            Nb = coords_boundary.shape[0]
+
+            # pick one physical configuration (e.g. first in batch)
+            param_single = paramb[0:1]                 # (1, param_dim)
+
+            # repeat for all boundary points
+            params_boundary = param_single.repeat(Nb, 1)  # (Nb, param_dim)
+
+
+            loss_E_bc, loss_dE_bc = boundary_loss(
+                model, coords_boundary, params_boundary, R
+            )
+
+            loss = (
+                lambda_data*data_loss 
+                + lambda_pde * pde_loss 
+                + lambda_E_bc * loss_E_bc 
+                + lambda_dE_bc * loss_dE_bc
+            )
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+            epoch_data += data_loss.item()
+            epoch_pde  += pde_loss.item()
+            epoch_Ebc  += loss_E_bc.item()
+            epoch_dEbc += loss_dE_bc.item()
+        
+        writer.writerow([
+                    epoch,
+                    epoch_loss,
+                    epoch_data,
+                    epoch_pde,
+                    epoch_Ebc,
+                    epoch_dEbc
+                ])
+
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch}/{epochs} - Loss = {epoch_loss/len(train_loader):.6f}", 
+                    f"Data: {data_loss.item():.6f}", 
+                    f"PDE: {pde_loss.item():.6f}",
+                    f"BC_E: {loss_E_bc.item():.6f}", 
+                    f"BC_dE: {loss_dE_bc.item():.6f}")
 
 # ---------------------------------------------------------
 # 6. Test evaluation
@@ -431,5 +447,5 @@ print("\n✅ Test MSE:", np.mean(test_losses))
 # ---------------------------------------------------------
 # 7. Save model
 # ---------------------------------------------------------
-torch.save(model.state_dict(), "models/Efield_predictor_deeponet_physics_only.pt")
-print("✅ Saved model as Efield_predictor_deeponet_physics_only.pt")
+torch.save(model.state_dict(), "models/Efield_predictor_deeponet.pt")
+print("✅ Saved model as Efield_predictor_deeponet.pt")

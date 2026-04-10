@@ -66,7 +66,7 @@ class DeepONet(nn.Module):
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
-model_path = os.path.join(script_dir, "models/Efield_predictor_deeponet.pt")
+model_path = os.path.join(script_dir, "models/Efield_predictor_deeponet_physics_only.pt")
 data_path = os.path.join(script_dir, "inputs/electric_fields.npz")
 
 print("Loading DeepONet model:", model_path)
@@ -87,7 +87,7 @@ num_points = H * W
 # ---------------------------------------------------------
 # 3. Select wavelength and prepare inputs
 # ---------------------------------------------------------
-lams = np.linspace(10.0, 40.0, 20)
+lams = np.linspace(5.0, 45.0, 40)
 avg_log_rel_errors = []
 
 for chosen_lam in lams:

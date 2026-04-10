@@ -57,7 +57,7 @@ num_points = H * W
 # ---------------------------------------------------------
 # 3. Select wavelength and prepare inputs
 # ---------------------------------------------------------
-lams = np.linspace(1.0, 20.0, 20)
+lams = np.linspace(1.0, 40.0, 20)
 avg_log_rel_errors = []
 
 for chosen_lam in lams:
